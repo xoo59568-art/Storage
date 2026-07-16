@@ -389,6 +389,7 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not is_save_mode_on(chat_id):
         return  # save mode off in this chat, ignore

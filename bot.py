@@ -1,15 +1,20 @@
 import os
+import re
 import logging
 import sqlite3
 import asyncio
+import tempfile
+import shutil
+import urllib.parse
 from collections import defaultdict
 from datetime import datetime
 
 from dotenv import load_dotenv
 load_dotenv()
 
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -42,6 +47,19 @@ ADMIN_IDS = {
 # Delay (seconds) between processing each queued file, to stay under Telegram's
 # rate limits when saving large batches (e.g. 1000+ files at once).
 QUEUE_DELAY_SECONDS = float(os.environ.get("QUEUE_DELAY_SECONDS", "1.2"))
+
+# Bot API hard-caps uploads of new (not-already-on-Telegram) files at 50MB
+# unless you self-host a local Bot API server. Files bigger than this are skipped.
+MAX_UPLOAD_MB = float(os.environ.get("MAX_UPLOAD_MB", "50"))
+MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
+
+TERABOX_API_BASE = "https://nayan-video-downloader.vercel.app/teraboxv2?url="
+TERABOX_DOMAINS = (
+    "terabox.com", "1024terabox.com", "1024tera.com", "teraboxapp.com",
+    "teraboxlink.com", "momerybox.com", "4funbox.com", "mirrobox.com",
+    "nephobox.com", "freeterabox.com",
+)
+URL_REGEX = re.compile(r"https?://\S+")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -159,8 +177,8 @@ def is_admin_user(user_id: int) -> bool:
 # ---------------------------------------------------------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "স্বাগতম! এই বটকে সরাসরি ভিডিও/ফটো/ফাইল পাঠালে বা forward করলে সেটা\n"
-        "নির্দিষ্ট স্টোরেজ গ্রুপে জমা হয়ে যাবে।\n\n"
+        "স্বাগতম! এই বটকে সরাসরি ভিডিও/ফটো/ফাইল পাঠালে, forward করলে, বা কোনো ভিডিও/CDN "
+        "URL এমনকি Terabox লিংক পাঠালে সেটা\nনির্দিষ্ট স্টোরেজ গ্রুপে জমা হয়ে যাবে।\n\n"
         "কমান্ড সমূহ (শুধু admin ব্যবহার করতে পারবে):\n"
         "/save - সেভ মোড চালু করুন, এরপর ফাইল পাঠান/forward করুন\n"
         "/stopsave - সেভ মোড বন্ধ করুন\n"
@@ -286,7 +304,91 @@ async def restore_document_handler(update: Update, context: ContextTypes.DEFAULT
     raise ApplicationHandlerStop
 
 
-async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------------------------------------------------------------------
+# URL / Terabox download helpers
+# ---------------------------------------------------------------------------
+def is_terabox_url(url: str) -> bool:
+    return any(domain in url.lower() for domain in TERABOX_DOMAINS)
+
+
+async def resolve_terabox(url: str, client: httpx.AsyncClient):
+    """Calls the Terabox resolver API and returns (candidate_urls, filename)."""
+    api_url = TERABOX_API_BASE + urllib.parse.quote(url, safe="")
+    resp = await client.get(api_url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("status") != "success" or not data.get("videos"):
+        raise ValueError("Terabox লিংক থেকে ভিডিও খুঁজে পাওয়া যায়নি")
+
+    video = data["videos"][0]
+    name = video.get("name") or "video.mp4"
+    # Two-level fallback: try the direct download link first, then the stream url.
+    candidates = [video.get("normal_dlink"), video.get("stream_url")]
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        raise ValueError("Terabox response এ কোনো download link পাওয়া যায়নি")
+    return candidates, name
+
+
+async def download_to_file(client: httpx.AsyncClient, url: str, dest_path: str, max_bytes: int) -> int:
+    """Streams a URL to disk, aborting early if it exceeds max_bytes."""
+    async with client.stream("GET", url, timeout=60, follow_redirects=True) as resp:
+        resp.raise_for_status()
+        total = 0
+        with open(dest_path, "wb") as f:
+            async for chunk in resp.aiter_bytes(chunk_size=256 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(
+                        f"ফাইল সাইজ {max_bytes // (1024 * 1024)}MB লিমিটের বেশি (Bot API সীমা)"
+                    )
+                f.write(chunk)
+    return total
+
+
+async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles plain text messages containing a video/CDN URL or a Terabox link."""
+    chat_id = update.effective_chat.id
+    if not is_save_mode_on(chat_id):
+        return
+    if not is_admin_user(update.effective_user.id):
+        return
+    if not STORAGE_GROUP_ID:
+        await update.message.reply_text("⚠️ STORAGE_GROUP_ID সেট করা নেই, তাই সেভ করা যাচ্ছে না।")
+        return
+
+    text = update.message.text or ""
+    urls = URL_REGEX.findall(text)
+    if not urls:
+        return
+
+    queue: asyncio.Queue = context.application.bot_data["queue"]
+    pending_counts = context.application.bot_data["pending_counts"]
+    batch_active = context.application.bot_data["batch_active"]
+
+    for url in urls:
+        item = {
+            "kind": "url",
+            "origin_chat_id": chat_id,
+            "url": url,
+            "is_terabox": is_terabox_url(url),
+            "caption": "",
+            "added_by": update.effective_user.id,
+        }
+        await queue.put(item)
+        pending_counts[chat_id] += 1
+
+    if not batch_active.get(chat_id):
+        batch_active[chat_id] = True
+        await update.message.reply_text(
+            "📥 লিংক জমা নেওয়া হয়েছে। ডাউনলোড ও সেভ হতে কিছুক্ষণ সময় লাগতে পারে "
+            f"(⚠️ Bot API লিমিটের কারণে {int(MAX_UPLOAD_MB)}MB এর বেশি বড় ফাইল স্কিপ হয়ে যাবে)। "
+            "শেষ হলে জানানো হবে।"
+        )
+
+
+
     chat_id = update.effective_chat.id
     if not is_save_mode_on(chat_id):
         return  # save mode off in this chat, ignore
@@ -317,6 +419,7 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     item = {
+        "kind": "copy",
         "origin_chat_id": chat_id,
         "message_id": msg.message_id,
         "file_id": file_obj.file_id,
@@ -342,6 +445,72 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def process_copy_item(item, bot):
+    if item["origin_chat_id"] != STORAGE_GROUP_ID:
+        await bot.copy_message(
+            chat_id=STORAGE_GROUP_ID,
+            from_chat_id=item["origin_chat_id"],
+            message_id=item["message_id"],
+        )
+    save_file(
+        chat_id=STORAGE_GROUP_ID,
+        file_id=item["file_id"],
+        file_unique_id=item["file_unique_id"],
+        file_type=item["file_type"],
+        caption=item["caption"],
+        added_by=item["added_by"],
+    )
+
+
+async def process_url_item(item, bot):
+    tmp_dir = tempfile.mkdtemp(prefix="tgbot_")
+    try:
+        async with httpx.AsyncClient() as client:
+            if item["is_terabox"]:
+                candidate_urls, name = await resolve_terabox(item["url"], client)
+            else:
+                candidate_urls = [item["url"]]
+                name = item["url"].split("?")[0].rstrip("/").split("/")[-1] or "video.mp4"
+
+            if "." not in name:
+                name += ".mp4"
+
+            dest_path = os.path.join(tmp_dir, name)
+            last_error = None
+            downloaded = False
+            for candidate in candidate_urls:
+                try:
+                    await download_to_file(client, candidate, dest_path, MAX_UPLOAD_BYTES)
+                    downloaded = True
+                    break
+                except Exception as e:
+                    last_error = e
+                    continue
+
+            if not downloaded:
+                raise last_error or ValueError("ডাউনলোড ব্যর্থ হয়েছে")
+
+            with open(dest_path, "rb") as f:
+                sent_msg = await bot.send_video(
+                    chat_id=STORAGE_GROUP_ID,
+                    video=f,
+                    caption=item.get("caption") or name,
+                    supports_streaming=True,
+                )
+
+        media_obj = sent_msg.video or sent_msg.document
+        save_file(
+            chat_id=STORAGE_GROUP_ID,
+            file_id=media_obj.file_id,
+            file_unique_id=media_obj.file_unique_id,
+            file_type="video" if sent_msg.video else "document",
+            caption=item.get("caption") or "",
+            added_by=item["added_by"],
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 async def queue_worker(application):
     queue: asyncio.Queue = application.bot_data["queue"]
     pending_counts = application.bot_data["pending_counts"]
@@ -350,21 +519,12 @@ async def queue_worker(application):
 
     while True:
         item = await queue.get()
+        kind = item.get("kind", "copy")
         try:
-            if item["origin_chat_id"] != STORAGE_GROUP_ID:
-                await bot.copy_message(
-                    chat_id=STORAGE_GROUP_ID,
-                    from_chat_id=item["origin_chat_id"],
-                    message_id=item["message_id"],
-                )
-            save_file(
-                chat_id=STORAGE_GROUP_ID,
-                file_id=item["file_id"],
-                file_unique_id=item["file_unique_id"],
-                file_type=item["file_type"],
-                caption=item["caption"],
-                added_by=item["added_by"],
-            )
+            if kind == "url":
+                await process_url_item(item, bot)
+            else:
+                await process_copy_item(item, bot)
         except RetryAfter as e:
             # Telegram is asking us to slow down. Wait, then retry this same item.
             wait_time = e.retry_after + 1
@@ -373,14 +533,15 @@ async def queue_worker(application):
             await asyncio.sleep(wait_time)
             await queue.put(item)
             continue
-        except TelegramError as e:
-            logger.exception(f"Failed to save queued file: {e}")
+        except Exception as e:
+            logger.exception(f"Failed to process queued item: {e}")
             pending_counts[item["origin_chat_id"]] = max(
                 0, pending_counts[item["origin_chat_id"]] - 1
             )
             try:
+                label = item.get("url", "ফাইল")
                 await bot.send_message(
-                    item["origin_chat_id"], f"⚠️ একটা ফাইল সেভ করা যায়নি: {e}"
+                    item["origin_chat_id"], f"⚠️ সেভ করা যায়নি ({label}): {e}"
                 )
             except Exception:
                 pass
@@ -516,6 +677,7 @@ def main():
             media_handler,
         )
     )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, url_handler))
     app.add_handler(CallbackQueryHandler(page_callback, pattern=r"^vidpage:"))
 
     logger.info("Bot starting...")

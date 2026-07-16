@@ -1,14 +1,18 @@
 import os
 import logging
 import sqlite3
+import asyncio
+from collections import defaultdict
 from datetime import datetime
 
 from dotenv import load_dotenv
 load_dotenv()
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
@@ -34,6 +38,10 @@ STORAGE_GROUP_ID = int(STORAGE_GROUP_ID) if STORAGE_GROUP_ID else None
 ADMIN_IDS = {
     int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()
 }
+
+# Delay (seconds) between processing each queued file, to stay under Telegram's
+# rate limits when saving large batches (e.g. 1000+ files at once).
+QUEUE_DELAY_SECONDS = float(os.environ.get("QUEUE_DELAY_SECONDS", "1.2"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -157,7 +165,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/save - সেভ মোড চালু করুন, এরপর ফাইল পাঠান/forward করুন\n"
         "/stopsave - সেভ মোড বন্ধ করুন\n"
         "/files - সেভ করা ফাইল দেখুন (১০টা করে, Next বাটন দিয়ে পরেরগুলো)\n"
-        "/stats - মোট কতটা ফাইল সেভ আছে দেখুন\n\n"
+        "/stats - মোট কতটা ফাইল সেভ আছে দেখুন\n"
+        "/backup - ডাটাবেজের ব্যাকআপ ফাইল পান (অন্য সার্ভারে নিতে)\n"
+        "/restore - ব্যাকআপ ফাইল দিয়ে ডাটা ফিরিয়ে আনুন\n\n"
         "সেটআপের জন্য:\n"
         "/myid - নিজের Telegram user ID দেখুন (ADMIN_IDS এ বসানোর জন্য)\n"
         "/groupid - এই গ্রুপের ID দেখুন (STORAGE_GROUP_ID এ বসানোর জন্য)"
@@ -203,7 +213,77 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     total = count_videos(STORAGE_GROUP_ID) if STORAGE_GROUP_ID else 0
     mode = "চালু ✅" if is_save_mode_on(update.effective_chat.id) else "বন্ধ ⛔"
-    await update.message.reply_text(f"মোট সেভ করা ফাইল: {total}\nSave mode (এই চ্যাটে): {mode}")
+    queue = context.application.bot_data.get("queue")
+    queue_size = queue.qsize() if queue else 0
+    await update.message.reply_text(
+        f"মোট সেভ করা ফাইল: {total}\n"
+        f"Save mode (এই চ্যাটে): {mode}\n"
+        f"কিউতে অপেক্ষমান ফাইল: {queue_size}"
+    )
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("এই কমান্ড শুধু admin ব্যবহার করতে পারবে।")
+        return
+    if not os.path.exists(DB_PATH):
+        await update.message.reply_text("এখনো কোনো ডাটা সেভ হয়নি, ব্যাকআপ করার কিছু নেই।")
+        return
+
+    total = count_videos(STORAGE_GROUP_ID) if STORAGE_GROUP_ID else 0
+    with open(DB_PATH, "rb") as f:
+        await update.message.reply_document(
+            document=f,
+            filename=os.path.basename(DB_PATH),
+            caption=(
+                f"📦 ব্যাকআপ ফাইল (মোট {total}টা ফাইলের রেফারেন্স আছে এতে)।\n\n"
+                "নতুন সার্ভারে migrate করতে:\n"
+                "1) এই ফাইলটা ডাউনলোড করে রাখুন\n"
+                "2) নতুন সার্ভারে বট বসিয়ে চালু করুন (একই STORAGE_GROUP_ID, ADMIN_IDS সহ .env)\n"
+                "3) বটকে /restore কমান্ড দিন, তারপর এই ফাইলটা পাঠান — সব ডাটা ফিরে আসবে"
+            ),
+        )
+
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("এই কমান্ড শুধু admin ব্যবহার করতে পারবে।")
+        return
+    awaiting = context.application.bot_data.setdefault("awaiting_restore", set())
+    awaiting.add(update.effective_user.id)
+    await update.message.reply_text(
+        "📥 ঠিক আছে, এখন `/backup` দিয়ে পাওয়া সেই ব্যাকআপ ফাইলটা (storage.db) এখানে পাঠান।\n"
+        "⚠️ এটা বর্তমান ডাটাবেজ পুরোপুরি বদলে দিবে।",
+        parse_mode="Markdown",
+    )
+
+
+async def restore_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    awaiting = context.application.bot_data.get("awaiting_restore", set())
+
+    if user_id not in awaiting or not is_admin_user(user_id):
+        return  # not in restore mode, let other handlers (e.g. media_handler) process this
+    if not update.message or not update.message.document:
+        return
+
+    doc = update.message.document
+    tmp_path = DB_PATH + ".restore_tmp"
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(tmp_path)
+        os.replace(tmp_path, DB_PATH)
+        awaiting.discard(user_id)
+        total = count_videos(STORAGE_GROUP_ID) if STORAGE_GROUP_ID else 0
+        await update.message.reply_text(
+            f"✅ ডাটাবেজ restore সম্পন্ন হয়েছে। মোট {total}টা ফাইলের রেফারেন্স ফিরে পাওয়া গেছে।"
+        )
+    except Exception as e:
+        logger.exception("Restore failed")
+        await update.message.reply_text(f"⚠️ Restore ব্যর্থ হয়েছে: {e}")
+
+    # Stop this update from also being handled by media_handler in the next group
+    raise ApplicationHandlerStop
 
 
 async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,29 +316,97 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not file_obj:
         return
 
-    # Copy (archive) the message into the storage group, unless it was
-    # already sent directly in the storage group itself.
-    if chat_id != STORAGE_GROUP_ID:
-        try:
-            await context.bot.copy_message(
-                chat_id=STORAGE_GROUP_ID,
-                from_chat_id=chat_id,
-                message_id=msg.message_id,
-            )
-        except Exception as e:
-            logger.exception("Failed to copy message to storage group")
-            await msg.reply_text(f"⚠️ স্টোরেজ গ্রুপে জমা করা যায়নি: {e}")
-            return
+    item = {
+        "origin_chat_id": chat_id,
+        "message_id": msg.message_id,
+        "file_id": file_obj.file_id,
+        "file_unique_id": file_obj.file_unique_id,
+        "file_type": file_type,
+        "caption": msg.caption or "",
+        "added_by": update.effective_user.id,
+    }
 
-    save_file(
-        chat_id=STORAGE_GROUP_ID,
-        file_id=file_obj.file_id,
-        file_unique_id=file_obj.file_unique_id,
-        file_type=file_type,
-        caption=msg.caption or "",
-        added_by=update.effective_user.id,
-    )
-    await msg.reply_text("✅ সেভ হয়েছে ও স্টোরেজ গ্রুপে জমা হয়েছে।")
+    queue: asyncio.Queue = context.application.bot_data["queue"]
+    pending_counts = context.application.bot_data["pending_counts"]
+    batch_active = context.application.bot_data["batch_active"]
+
+    await queue.put(item)
+    pending_counts[chat_id] += 1
+
+    if not batch_active.get(chat_id):
+        batch_active[chat_id] = True
+        await msg.reply_text(
+            "📥 ফাইল জমা নেওয়া শুরু হয়েছে। Telegram এর rate limit অনুযায়ী একটু একটু করে "
+            "সেভ হবে (অনেক ফাইল হলে সময় লাগতে পারে) — কোনো ফাইল miss হবে না। "
+            "সব শেষ হলে আপনাকে জানানো হবে।"
+        )
+
+
+async def queue_worker(application):
+    queue: asyncio.Queue = application.bot_data["queue"]
+    pending_counts = application.bot_data["pending_counts"]
+    batch_active = application.bot_data["batch_active"]
+    bot = application.bot
+
+    while True:
+        item = await queue.get()
+        try:
+            if item["origin_chat_id"] != STORAGE_GROUP_ID:
+                await bot.copy_message(
+                    chat_id=STORAGE_GROUP_ID,
+                    from_chat_id=item["origin_chat_id"],
+                    message_id=item["message_id"],
+                )
+            save_file(
+                chat_id=STORAGE_GROUP_ID,
+                file_id=item["file_id"],
+                file_unique_id=item["file_unique_id"],
+                file_type=item["file_type"],
+                caption=item["caption"],
+                added_by=item["added_by"],
+            )
+        except RetryAfter as e:
+            # Telegram is asking us to slow down. Wait, then retry this same item.
+            wait_time = e.retry_after + 1
+            logger.warning(f"Flood control hit, waiting {wait_time}s before retrying")
+            queue.task_done()
+            await asyncio.sleep(wait_time)
+            await queue.put(item)
+            continue
+        except TelegramError as e:
+            logger.exception(f"Failed to save queued file: {e}")
+            pending_counts[item["origin_chat_id"]] = max(
+                0, pending_counts[item["origin_chat_id"]] - 1
+            )
+            try:
+                await bot.send_message(
+                    item["origin_chat_id"], f"⚠️ একটা ফাইল সেভ করা যায়নি: {e}"
+                )
+            except Exception:
+                pass
+            queue.task_done()
+            await asyncio.sleep(QUEUE_DELAY_SECONDS)
+            continue
+
+        origin = item["origin_chat_id"]
+        pending_counts[origin] = max(0, pending_counts[origin] - 1)
+
+        if pending_counts[origin] == 0 and batch_active.get(origin):
+            batch_active[origin] = False
+            try:
+                await bot.send_message(origin, "✅ সব ফাইল সেভ হয়ে গেছে ও স্টোরেজ গ্রুপে জমা হয়েছে।")
+            except Exception:
+                pass
+
+        queue.task_done()
+        await asyncio.sleep(QUEUE_DELAY_SECONDS)
+
+
+async def on_startup(application):
+    application.bot_data["queue"] = asyncio.Queue()
+    application.bot_data["pending_counts"] = defaultdict(int)
+    application.bot_data["batch_active"] = {}
+    asyncio.create_task(queue_worker(application))
 
 
 async def send_video_page(chat_id, page, context: ContextTypes.DEFAULT_TYPE):
@@ -347,7 +495,7 @@ def main():
 
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
@@ -357,6 +505,11 @@ def main():
     app.add_handler(CommandHandler("files", files_cmd))
     app.add_handler(CommandHandler("videos", files_cmd))  # alias
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("restore", restore_cmd))
+    # Runs in an earlier group so it can intercept the restore .db upload
+    # before the normal media_handler tries to save it as a regular file.
+    app.add_handler(MessageHandler(filters.Document.ALL, restore_document_handler), group=-1)
     app.add_handler(
         MessageHandler(
             filters.VIDEO | filters.PHOTO | filters.Document.ALL | filters.AUDIO,
